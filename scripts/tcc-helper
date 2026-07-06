@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────
+#  tcc-helper — Tor Control Center privileged helper
+#  (اسکریپت واسط دارای دسترسی روت — Tor Control Center)
+#
+#  This is the ONLY binary sudoers grants passwordless root access to.
+#  Every action below is a fixed, whitelisted operation with validated
+#  arguments — nothing here ever interpolates unsanitized user input into
+#  a shell string, so this cannot be turned into an arbitrary-command
+#  escape hatch even though it's callable via NOPASSWD sudo.
+#
+#  این تنها فایلیه که sudoers بهش دسترسی روتِ بدون-پسورد میده. هر اکشن
+#  زیر یه عملیات ثابت و از پیش تعریف‌شده‌ست با آرگومان‌های validate-شده؛
+#  هیچ ورودی کاربر مستقیم داخل یه رشتهٔ shell قرار نمی‌گیره، پس حتی با
+#  وجود NOPASSWD sudo نمیشه از این اسکریپت برای اجرای دستور دلخواه
+#  سوءاستفاده کرد.
+#
+#  Contrast with the previous design, which granted NOPASSWD on the bare
+#  `iptables`/`ip6tables` binaries: those accept ANY arguments, which is
+#  equivalent to unrestricted root (flush any chain, redirect any traffic,
+#  attach netfilter hooks, etc). This script narrows that down to exactly
+#  the handful of operations Tor Control Center actually needs.
+#
+#  در مقابل طراحی قبلی که مستقیم به خود iptables/ip6tables دسترسی
+#  passwordless می‌داد: اون باینری‌ها هر آرگومانی رو قبول می‌کنن، یعنی
+#  عملاً معادل دسترسی روتِ نامحدود بود (پاک‌کردن هر chain، ریدایرکت هر
+#  ترافیکی، و…). این اسکریپت اون دسترسی رو به همون چند عملیات مشخصی که
+#  برنامه واقعاً بهش نیاز داره محدود می‌کنه.
+# ─────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# تگ‌هایی که رو قوانین iptables می‌ذاریم تا بعداً بتونیم قوانین خودمون رو
+# (مثلاً موقع ری‌استارت برنامه) قطعاً تشخیص بدیم، نه با حدس‌زدن.
+KS_TAG="tcc_killswitch"
+TP_TAG="tcc_transproxy"
+TORRC="/etc/tor/torrc"
+TORRC_BEGIN="# TCC-BRIDGES-BEGIN (managed by tor-control-center — do not edit by hand)"
+TORRC_END="# TCC-BRIDGES-END"
+RESOLV="/etc/resolv.conf"
+
+usage() { echo "usage: tcc-helper <action> [args...]" >&2; exit 2; }
+
+# اعتبارسنجی ورودی‌ها قبل از استفاده تو دستورات iptables — تنها حروف/عدد
+# مجازه، چون این مقادیر مستقیم وارد آرگومان iptables میشن.
+is_safe_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
+is_port()      { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( "$1" >= 1 && "$1" <= 65535 )); }
+
+[[ $# -ge 1 ]] || usage
+action="$1"; shift || true
+
+case "$action" in
+
+  tor-start)   systemctl start tor ;;
+  tor-stop)    systemctl stop tor ;;
+  tor-restart) systemctl restart tor ;;
+
+  # ── kill switch ──────────────────────────────────────────────────────────
+  # (قطع‌کنندهٔ اضطراری — بلاک‌کردن هر ترافیکی جز Tor)
+  killswitch-on)
+    tor_user="${1:?tor user required}"
+    is_safe_name "$tor_user" || { echo "invalid tor user" >&2; exit 3; }
+
+    # اجازه به loopback، اجازه به خودِ فرآیند Tor (بر اساس یوزر سیستمی‌ش)،
+    # اجازه به اتصال‌های از قبل برقرارشده، و رد کردن باقی همه‌چیز.
+    iptables -t nat -F OUTPUT
+    iptables -F OUTPUT
+    iptables -A OUTPUT -o lo -j ACCEPT
+    iptables -A OUTPUT -m owner --uid-owner "$tor_user" -m comment --comment "$KS_TAG" -j ACCEPT
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -m comment --comment "$KS_TAG" -j ACCEPT
+    iptables -A OUTPUT -m comment --comment "$KS_TAG" -j REJECT
+
+    # همون منطق برای IPv6 هم تکرار میشه، چون Tor ترافیک IPv6 برنامه‌ها رو
+    # از این مسیر تونل نمی‌کنه — پس safest کار اینه که کلاً IPv6 بلاک بشه
+    # تا لو نره (قبلاً این بخش اصلاً وجود نداشت).
+    if command -v ip6tables &>/dev/null; then
+      ip6tables -F OUTPUT
+      ip6tables -A OUTPUT -o lo -j ACCEPT
+      ip6tables -A OUTPUT -m comment --comment "$KS_TAG" -j REJECT
+    fi
+    ;;
+
+  killswitch-off)
+    iptables -F OUTPUT
+    iptables -t nat -F OUTPUT
+    command -v ip6tables &>/dev/null && ip6tables -F OUTPUT || true
+    ;;
+
+  killswitch-status)
+    # وضعیت واقعی فایروال رو می‌خونیم، نه یه فلگ تو حافظه — چون بعد از
+    # ری‌استارت سیستم یا سرویس، قوانین iptables پاک میشن ولی اگه به یه
+    # فلگ حافظه‌ای اعتماد کنیم، UI هنوز فکر می‌کنه محافظت روشنه.
+    iptables -S OUTPUT 2>/dev/null | grep -q -- "$KS_TAG"
+    ;;
+
+  # ── transparent proxy ────────────────────────────────────────────────────
+  # (تونل‌کردن شفاف کل ترافیک TCP/DNS سیستم از داخل Tor)
+  tp-on)
+    tor_user="${1:?tor user required}"
+    dns_port="${2:?dns port required}"
+    trans_port="${3:?trans port required}"
+    is_safe_name "$tor_user"  || { echo "invalid tor user" >&2; exit 3; }
+    is_port "$dns_port"       || { echo "invalid dns port" >&2; exit 3; }
+    is_port "$trans_port"     || { echo "invalid trans port" >&2; exit 3; }
+
+    iptables -t nat -A OUTPUT -p udp --dport 53 -m comment --comment "$TP_TAG" \
+      -j REDIRECT --to-ports "$dns_port"
+    iptables -t nat -A OUTPUT -m owner --uid-owner "$tor_user" -m comment --comment "$TP_TAG" -j RETURN
+    iptables -t nat -A OUTPUT -p tcp --syn -m comment --comment "$TP_TAG" \
+      -j REDIRECT --to-ports "$trans_port"
+
+    # IPv6 از این مسیر transparent tunnel نمیشه، پس به‌جای این‌که مستقیم
+    # و بدون محافظت بره بیرون (leak)، کلاً بلاکش می‌کنیم.
+    if command -v ip6tables &>/dev/null; then
+      ip6tables -A OUTPUT -o lo -j ACCEPT
+      ip6tables -A OUTPUT -m comment --comment "$TP_TAG" -j REJECT
+    fi
+    ;;
+
+  tp-off)
+    iptables -t nat -F OUTPUT
+    command -v ip6tables &>/dev/null && ip6tables -F OUTPUT || true
+    ;;
+
+  tp-status)
+    iptables -t nat -S OUTPUT 2>/dev/null | grep -q -- "$TP_TAG"
+    ;;
+
+  ipv6-available)
+    command -v ip6tables &>/dev/null && ip6tables -L -n &>/dev/null
+    ;;
+
+  # ── DNS lock (defense in depth alongside the kill switch) ────────────────
+  # (قفل DNS — یه لایهٔ محافظتی اضافه در کنار کیل‌سوییچ)
+  dns-lock)
+    # فایل resolv.conf رو immutable می‌کنیم تا هیچ سرویسی (NetworkManager،
+    # systemd-resolved، یه کلاینت VPN) نتونه بی‌سروصدا resolver رو عوض کنه
+    # و از مسیر کیل‌سوییچ لو بره.
+    chattr +i "$RESOLV" 2>/dev/null || true
+    ;;
+
+  dns-unlock)
+    chattr -i "$RESOLV" 2>/dev/null || true
+    ;;
+
+  # ── bridges / pluggable transports ───────────────────────────────────────
+  # (بریج‌ها / ترنسپورت‌های ضد-فیلترینگ)
+  # Content is streamed on stdin as base64, never as an argv string — this
+  # avoids any shell-escaping edge cases with arbitrary bridge-line text
+  # (which can contain spaces, quotes, etc).
+  #
+  # محتوا از stdin و به‌صورت base64 خونده میشه، نه به‌عنوان آرگومان خط
+  # فرمان — چون خط‌های bridge می‌تونن فاصله/کوتیشن داشته باشن و اگه
+  # به‌عنوان آرگومان پاس داده بشن ریسک escaping اشتباه داره.
+  write-bridges)
+    payload="$(cat)"
+    [[ -f "$TORRC" ]] || { echo "torrc not found at $TORRC" >&2; exit 4; }
+
+    cp "$TORRC" "${TORRC}.tcc.bak"
+
+    # Strip any previously-managed block first.
+    # (اول هر بلاک قدیمیِ managed رو حذف می‌کنیم)
+    awk -v b="$TORRC_BEGIN" -v e="$TORRC_END" '
+      $0==b {skip=1; next}
+      $0==e {skip=0; next}
+      skip!=1 {print}
+    ' "${TORRC}.tcc.bak" > "$TORRC"
+
+    if [[ -n "$payload" ]]; then
+      decoded="$(printf '%s' "$payload" | base64 -d)"
+      {
+        echo "$TORRC_BEGIN"
+        printf '%s\n' "$decoded"
+        echo "$TORRC_END"
+      } >> "$TORRC"
+    fi
+
+    systemctl restart tor
+    ;;
+
+  *)
+    usage
+    ;;
+esac

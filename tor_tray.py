@@ -4,6 +4,10 @@
 Professional KDE/GNOME system tray — real Tor monitoring & control
 Author: tor_tray v2
 Requires: python3-pyqt6, requests[socks]
+
+مرکز کنترل Tor — نمایشگر و کنترل‌کنندهٔ واقعی Tor روی سیستم‌تری KDE/GNOME.
+شامل: روشن/خاموش‌کردن سرویس Tor، هویت جدید، کیل‌سوییچ، پراکسی شفاف،
+مدیریت بریج/ترنسپورت ضدسانسور، و پنل لاگ.
 """
 
 from __future__ import annotations
@@ -13,12 +17,14 @@ import sys
 import json
 import time
 import socket
+import base64
 import subprocess
 import threading
 import logging
+import webbrowser
 from datetime import datetime
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 # ── Enforce PyQt6 ─────────────────────────────────────────────────────────────
@@ -26,14 +32,14 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QSystemTrayIcon, QMenu, QWidget,
         QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-        QTextEdit, QFrame, QGridLayout, QSizePolicy,
+        QTextEdit, QFrame, QGridLayout, QComboBox, QDialog,
     )
     from PyQt6.QtCore import (
-        Qt, QTimer, QThread, pyqtSignal, QObject, QSize, QPoint,
+        Qt, QTimer, pyqtSignal, QObject, QPoint,
     )
     from PyQt6.QtGui import (
         QIcon, QPixmap, QPainter, QColor, QFont, QBrush,
-        QPen, QAction, QFontMetrics,
+        QPen, QAction,
     )
 except ImportError:
     print("ERROR: PyQt6 not found.\n  pip3 install PyQt6 --break-system-packages")
@@ -46,29 +52,93 @@ except ImportError:
     _HAS_REQUESTS = False
     print("WARNING: requests not found.  pip3 install requests[socks]")
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+# ── Config dir / files ────────────────────────────────────────────────────────
+CONFIG_DIR   = os.path.join(os.path.expanduser("~"), ".config", "tor-control-center")
+CONFIG_FILE  = os.path.join(CONFIG_DIR, "config.json")
+LOG_FILE     = os.path.join(CONFIG_DIR, "tor_tray.log")
+
+# ── Logging (console + rotating file) ─────────────────────────────────────────
+os.makedirs(CONFIG_DIR, exist_ok=True)
 log = logging.getLogger("tor_tray")
+log.setLevel(logging.INFO)
+
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter(
+    "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S"
+))
+log.addHandler(_console)
+
+try:
+    from logging.handlers import RotatingFileHandler
+    _file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    log.addHandler(_file_handler)
+except Exception as _e:
+    print(f"WARNING: could not set up file logging: {_e}")
+
+# ── Default constants (overridable via ~/.config/tor-control-center/config.json)
+_DEFAULTS = {
+    "tor_socks_host":   "127.0.0.1",
+    "tor_socks_port":   9050,
+    "tor_control_port": 9051,
+    "tor_trans_port":   9040,
+    "tor_dns_port":     5353,
+    "tor_check_url":    "https://check.torproject.org/api/ip",
+    "geoip_url":        "https://ipapi.co/{ip}/json/",
+    "direct_ip_url":    "https://api.ipify.org?format=json",
+    "poll_normal_sec":  8,
+    "poll_fast_sec":    2,
+    "request_timeout":  10,
+    "log_maxlen":       300,
+}
+
+
+def _load_config() -> dict:
+    """Load user overrides from ~/.config/tor-control-center/config.json, if present.
+
+    (تنظیمات کاربر رو از کانفیگ خارجی می‌خونه، اگه وجود داشته باشه؛ در غیر
+    این صورت مقادیر پیش‌فرض استفاده میشه.)
+    """
+    cfg = dict(_DEFAULTS)
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+            if isinstance(user_cfg, dict):
+                cfg.update({k: v for k, v in user_cfg.items() if k in _DEFAULTS})
+        except Exception as e:
+            log.warning(f"Failed to read {CONFIG_FILE}: {e} — using defaults")
+    return cfg
+
+
+_CFG = _load_config()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-TOR_SOCKS_HOST    = "127.0.0.1"
-TOR_SOCKS_PORT    = 9050
-TOR_CONTROL_PORT  = 9051
-TOR_TRANS_PORT    = 9040
-TOR_DNS_PORT      = 5353
+TOR_SOCKS_HOST    = _CFG["tor_socks_host"]
+TOR_SOCKS_PORT    = _CFG["tor_socks_port"]
+TOR_CONTROL_PORT  = _CFG["tor_control_port"]
+TOR_TRANS_PORT    = _CFG["tor_trans_port"]
+TOR_DNS_PORT      = _CFG["tor_dns_port"]
 
-TOR_CHECK_URL     = "https://check.torproject.org/api/ip"
-GEOIP_URL         = "http://ip-api.com/json/{ip}?fields=status,country,countryCode,isp,org,query"
-DIRECT_IP_URL     = "https://api.ipify.org?format=json"
+TOR_CHECK_URL     = _CFG["tor_check_url"]
+GEOIP_URL         = _CFG["geoip_url"]
+DIRECT_IP_URL     = _CFG["direct_ip_url"]
 
-POLL_NORMAL_SEC   = 8
-POLL_FAST_SEC     = 2
-REQUEST_TIMEOUT   = 10
-LOG_MAXLEN        = 300
+POLL_NORMAL_SEC   = _CFG["poll_normal_sec"]
+POLL_FAST_SEC     = _CFG["poll_fast_sec"]
+REQUEST_TIMEOUT   = _CFG["request_timeout"]
+LOG_MAXLEN        = _CFG["log_maxlen"]
+
+# iptables comment tags used to identify our own rules (for reliable status
+# detection across restarts, instead of trusting in-memory UI state).
+# (تگ‌هایی که رو قوانین iptables می‌ذاریم تا مطمئن بشیم قوانین خودمون رو
+# داریم می‌بینیم، نه یه حدس از وضعیت حافظه‌ای برنامه.)
+KS_TAG = "tcc_killswitch"
+TP_TAG = "tcc_transproxy"
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 P = {
@@ -277,13 +347,34 @@ class TorProbe(QObject):
 
     @staticmethod
     def _geoip(ip: str) -> dict:
+        """Look up GeoIP for the exit node, routed *through Tor* over HTTPS.
+
+        Previously this hit a plaintext (http://) endpoint directly on the
+        clear path — leaking the query to a third party outside Tor, and
+        prone to being blocked outright when the kill switch is active
+        (since only the Tor process itself is allowed to egress). Routing
+        via the SOCKS proxy keeps it consistent with the rest of the app.
+
+        (جست‌وجوی موقعیت جغرافیایی exit node — از داخل خود Tor و روی
+        HTTPS، نه مستقیم و plaintext مثل قبل.)
+        """
         if not _HAS_REQUESTS:
             return {}
+        proxies = {
+            "http":  f"socks5h://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}",
+            "https": f"socks5h://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}",
+        }
         try:
-            r = requests.get(GEOIP_URL.format(ip=ip), timeout=5)
+            r = requests.get(GEOIP_URL.format(ip=ip), proxies=proxies, timeout=6)
             r.raise_for_status()
             data = r.json()
-            return data if data.get("status") == "success" else {}
+            if data.get("error"):
+                return {}
+            return {
+                "country":     data.get("country_name", "—"),
+                "countryCode": data.get("country_code", ""),
+                "isp":         data.get("org") or data.get("asn") or "—",
+            }
         except Exception:
             return {}
 
@@ -307,12 +398,36 @@ class TorProbe(QObject):
 #  TorControl  — subprocess-based service & firewall control
 # ══════════════════════════════════════════════════════════════════════════════
 class TorControl:
+    """Subprocess-based service & firewall control.
+
+    All privileged operations go through a single narrow helper script
+    (`HELPER_PATH`, installed by setup.sh) instead of granting passwordless
+    sudo on `iptables`/`ip6tables`/`tee` directly. Those tools accept
+    arbitrary arguments, so a blanket `NOPASSWD: /sbin/iptables` rule is
+    effectively unrestricted root access via the firewall (flush any
+    chain, redirect any traffic, etc). The helper hard-codes the specific
+    whitelisted actions this app needs (case-matched, no shell
+    interpolation of user input into commands), and sudoers only allows
+    that one exact path — a meaningfully smaller trusted surface.
+
+    (کنترل سرویس Tor و فایروال از طریق subprocess. تمام عملیات‌های نیازمند
+    دسترسی روت از یه اسکریپت واسط باریک (tcc-helper) رد میشن، نه از طریق
+    دسترسی passwordless مستقیم به iptables/ip6tables. این اسکریپت واسط فقط
+    همون چند عملیات مشخص و از پیش validate-شده رو انجام میده.)
+    """
+
+    HELPER_PATH = "/usr/local/sbin/tcc-helper"
+
+    _tor_user_cache: Optional[str] = None
+    _ipv6_available: Optional[bool] = None
+    _helper_available: Optional[bool] = None
 
     @staticmethod
-    def _run(*args: str) -> tuple[bool, str]:
+    def _run(*args: str, input_text: Optional[str] = None) -> tuple[bool, str]:
         try:
             r = subprocess.run(
-                list(args), capture_output=True, text=True, timeout=15
+                list(args), capture_output=True, text=True, timeout=15,
+                input=input_text,
             )
             out = (r.stdout + r.stderr).strip()
             return r.returncode == 0, out
@@ -320,20 +435,108 @@ class TorControl:
             return False, str(e)
 
     @classmethod
-    def start(cls)   -> tuple[bool, str]: return cls._run("sudo","systemctl","start","tor")
+    def _helper(cls, *args: str, input_text: Optional[str] = None) -> tuple[bool, str]:
+        return cls._run("sudo", cls.HELPER_PATH, *args, input_text=input_text)
+
     @classmethod
-    def stop(cls)    -> tuple[bool, str]: return cls._run("sudo","systemctl","stop","tor")
+    def helper_available(cls) -> bool:
+        if cls._helper_available is None:
+            cls._helper_available = os.path.isfile(cls.HELPER_PATH)
+            if not cls._helper_available:
+                log.warning(
+                    f"{cls.HELPER_PATH} not found — run setup.sh to install the "
+                    f"privileged helper before using firewall features."
+                )
+        return cls._helper_available
+
     @classmethod
-    def restart(cls) -> tuple[bool, str]: return cls._run("sudo","systemctl","restart","tor")
+    def start(cls)   -> tuple[bool, str]: return cls._helper("tor-start")
+    @classmethod
+    def stop(cls)    -> tuple[bool, str]: return cls._helper("tor-stop")
+    @classmethod
+    def restart(cls) -> tuple[bool, str]: return cls._helper("tor-restart")
+
+    # ── Tor system-user detection ────────────────────────────────────────────
+    @classmethod
+    def tor_user(cls) -> str:
+        """Detect which system user Tor runs as.
+
+        Distros disagree: Debian/Ubuntu use 'debian-tor', Arch/Fedora often
+        use plain 'tor', some minimal images use '_tor'. Hard-coding
+        'debian-tor' meant the kill switch / transparent proxy would
+        silently exempt the wrong user (or nobody) on non-Debian systems,
+        defeating the whole point of a kill switch.
+
+        (تشخیص یوزر سیستمیِ Tor — چون توزیع‌های مختلف لینوکس اسم متفاوتی
+        براش استفاده می‌کنن، هاردکد کردن یه اسم ثابت باعث میشد کیل‌سوییچ
+        رو سیستم‌های غیر-Debian درست کار نکنه.)
+        """
+        if cls._tor_user_cache:
+            return cls._tor_user_cache
+        for candidate in ("debian-tor", "tor", "_tor"):
+            ok, _ = cls._run("id", "-u", candidate)
+            if ok:
+                cls._tor_user_cache = candidate
+                return candidate
+        log.warning("Could not detect Tor's system user — defaulting to 'debian-tor'")
+        cls._tor_user_cache = "debian-tor"
+        return cls._tor_user_cache
+
+    @classmethod
+    def _has_ip6tables(cls) -> bool:
+        if cls._ipv6_available is None:
+            ok, _ = cls._helper("ipv6-available")
+            cls._ipv6_available = ok
+            if not ok:
+                log.warning("ip6tables not available — IPv6 leak protection disabled")
+        return cls._ipv6_available
+
+    # ── control port auth ────────────────────────────────────────────────────
+    @staticmethod
+    def _cookie_auth_hex() -> Optional[str]:
+        """Read Tor's control-port auth cookie, if cookie auth is enabled."""
+        for path in (
+            "/run/tor/control.authcookie",
+            "/var/run/tor/control.authcookie",
+            "/var/lib/tor/control_auth_cookie",
+        ):
+            try:
+                with open(path, "rb") as f:
+                    return f.read().hex()
+            except OSError:
+                continue
+        return None
 
     @classmethod
     def new_identity(cls) -> tuple[bool, str]:
-        """Send NEWNYM via control port, fall back to restart."""
+        """Send NEWNYM via control port, fall back to restart.
+
+        Tries cookie auth first (the default on most distros when
+        CookieAuthentication is on); falls back to a blank AUTHENTICATE
+        for setups with no auth configured. Previously this only ever sent
+        an empty AUTHENTICATE, which silently fails whenever cookie auth is
+        enabled (the common case) and always fell through to a disruptive
+        full service restart instead of a cheap NEWNYM signal.
+
+        (درخواست هویت جدید (مدار جدید Tor) از طریق control port؛ اگه شکست
+        بخوره، به‌عنوان fallback کل سرویس رو ری‌استارت می‌کنه.)
+        """
         try:
             s = socket.socket()
             s.settimeout(4)
             s.connect(("127.0.0.1", TOR_CONTROL_PORT))
-            s.sendall(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
+
+            cookie_hex = cls._cookie_auth_hex()
+            if cookie_hex:
+                s.sendall(f'AUTHENTICATE {cookie_hex}\r\n'.encode())
+            else:
+                s.sendall(b'AUTHENTICATE ""\r\n')
+            auth_resp = s.recv(512).decode(errors="replace")
+            if "250" not in auth_resp:
+                s.close()
+                return False, f"Control port auth failed: {auth_resp.strip()}"
+
+            s.sendall(b'SIGNAL NEWNYM\r\nQUIT\r\n')
             resp = s.recv(512).decode(errors="replace")
             s.close()
             if "250" in resp:
@@ -343,61 +546,168 @@ class TorControl:
             log.warning(f"Control port failed ({e}), falling back to restart")
             return cls.restart()
 
+    # ── kill switch ──────────────────────────────────────────────────────────
     @classmethod
     def killswitch_on(cls) -> tuple[bool, str]:
-        """Block all non-Tor outbound traffic via iptables."""
-        cmds = [
-            ["sudo", "iptables", "-t", "nat", "-F", "OUTPUT"],
-            ["sudo", "iptables", "-F", "OUTPUT"],
-            # Allow loopback
-            ["sudo", "iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
-            # Allow Tor process itself
-            ["sudo", "iptables", "-A", "OUTPUT", "-m", "owner",
-             "--uid-owner", "debian-tor", "-j", "ACCEPT"],
-            # Allow established connections
-            ["sudo", "iptables", "-A", "OUTPUT", "-m", "state",
-             "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-            # Reject everything else
-            ["sudo", "iptables", "-A", "OUTPUT", "-j", "REJECT"],
-        ]
-        for cmd in cmds:
-            ok, out = cls._run(*cmd)
-            if not ok:
-                return False, f"iptables error: {out}"
-        return True, "Kill switch ON — non-Tor traffic blocked"
+        """Block all non-Tor outbound traffic (IPv4 + IPv6) and lock DNS.
+
+        IPv6 was previously left completely unfiltered — any host with
+        IPv6 connectivity could bypass the "kill switch" entirely over v6.
+        The helper now also blocks IPv6 egress, and additionally
+        immutable-locks /etc/resolv.conf (`chattr +i`) so nothing on the
+        system (NetworkManager, systemd-resolved, a VPN client, etc.) can
+        silently repoint DNS away from the loopback resolver while
+        protection is meant to be active.
+
+        (کیل‌سوییچ رو روشن می‌کنه: بلاک‌کردن هر ترافیک غیر-Tor روی IPv4 و
+        IPv6، به‌علاوه قفل‌کردن DNS تا هیچ سرویسی نتونه resolver رو عوض
+        کنه و از این مسیر لو بره.)
+        """
+        if not cls.helper_available():
+            return False, f"Privileged helper missing at {cls.HELPER_PATH} — run setup.sh"
+        tor_user = cls.tor_user()
+        ok, out = cls._helper("killswitch-on", tor_user)
+        if not ok:
+            return False, f"helper error: {out}"
+        cls._helper("dns-lock")
+        v6_note = "" if cls._has_ip6tables() else " WARNING: ip6tables unavailable, IPv6 is NOT protected."
+        return True, f"Kill switch ON (tor user: {tor_user}), DNS locked.{v6_note}"
 
     @classmethod
     def killswitch_off(cls) -> tuple[bool, str]:
-        """Remove kill switch rules."""
-        ok1, o1 = cls._run("sudo", "iptables", "-F", "OUTPUT")
-        ok2, o2 = cls._run("sudo", "iptables", "-t", "nat", "-F", "OUTPUT")
-        return (ok1 and ok2), f"{o1} {o2}".strip()
+        """Remove kill switch rules and unlock DNS."""
+        if not cls.helper_available():
+            return False, f"Privileged helper missing at {cls.HELPER_PATH} — run setup.sh"
+        ok, out = cls._helper("killswitch-off")
+        cls._helper("dns-unlock")
+        return ok, out or "Kill switch OFF, DNS unlocked."
 
     @classmethod
+    def killswitch_status(cls) -> bool:
+        """Query the real firewall state rather than trusting in-memory UI state.
+
+        Without this, a service/system restart clears the actual firewall
+        rules while the UI still shows "ON" — the user believes they're
+        protected when they aren't.
+        """
+        if not cls.helper_available():
+            return False
+        ok, _ = cls._helper("killswitch-status")
+        return ok
+
+    # ── transparent proxy ────────────────────────────────────────────────────
+    @classmethod
     def transparent_proxy_on(cls) -> tuple[bool, str]:
-        """Route all TCP + DNS through Tor transparently."""
-        cmds = [
-            # DNS → Tor DNS port
-            ["sudo", "iptables", "-t", "nat", "-A", "OUTPUT",
-             "-p", "udp", "--dport", "53",
-             "-j", "REDIRECT", "--to-ports", str(TOR_DNS_PORT)],
-            # TCP → Tor TransPort (exempt Tor itself)
-            ["sudo", "iptables", "-t", "nat", "-A", "OUTPUT",
-             "-m", "owner", "--uid-owner", "debian-tor", "-j", "RETURN"],
-            ["sudo", "iptables", "-t", "nat", "-A", "OUTPUT",
-             "-p", "tcp", "--syn",
-             "-j", "REDIRECT", "--to-ports", str(TOR_TRANS_PORT)],
-        ]
-        for cmd in cmds:
-            ok, out = cls._run(*cmd)
-            if not ok:
-                return False, f"iptables error: {out}"
-        return True, "Transparent proxy ON — all TCP/DNS tunnelled"
+        """Route all TCP + DNS through Tor transparently (IPv4); block IPv6.
+
+        Tor's TransPort here only handles IPv4. IPv6-capable destinations
+        would previously go out directly, unproxied and unblocked. Since
+        IPv6 can't be transparently tunnelled through this TransPort setup,
+        the helper blocks it outright instead of letting it leak.
+
+        (پراکسی شفاف رو روشن می‌کنه: تمام ترافیک TCP و DNS سیستم از داخل
+        Tor رد میشه (فقط IPv4)، و IPv6 برای جلوگیری از لو رفتن بلاک میشه.)
+        """
+        if not cls.helper_available():
+            return False, f"Privileged helper missing at {cls.HELPER_PATH} — run setup.sh"
+        tor_user = cls.tor_user()
+        ok, out = cls._helper("tp-on", tor_user, str(TOR_DNS_PORT), str(TOR_TRANS_PORT))
+        if not ok:
+            return False, f"helper error: {out}"
+        v6_note = "" if cls._has_ip6tables() else " WARNING: ip6tables unavailable, IPv6 is NOT protected."
+        return True, f"Transparent proxy ON — IPv4 tunnelled (tor user: {tor_user}).{v6_note}"
 
     @classmethod
     def transparent_proxy_off(cls) -> tuple[bool, str]:
-        ok, out = cls._run("sudo", "iptables", "-t", "nat", "-F", "OUTPUT")
+        if not cls.helper_available():
+            return False, f"Privileged helper missing at {cls.HELPER_PATH} — run setup.sh"
+        ok, out = cls._helper("tp-off")
         return ok, out or "Transparent proxy OFF"
+
+    @classmethod
+    def transparent_proxy_status(cls) -> bool:
+        """Query the real firewall state instead of trusting UI state."""
+        if not cls.helper_available():
+            return False
+        ok, _ = cls._helper("tp-status")
+        return ok
+
+    # ── anti-censorship: pluggable transports / bridges ─────────────────────
+    PT_BINARIES = {
+        "obfs4":      ["obfs4proxy"],
+        "meek-azure": ["meek-client"],
+        "snowflake":  ["snowflake-client"],
+    }
+
+    @classmethod
+    def detect_pt_binaries(cls) -> dict:
+        """Which pluggable-transport binaries are actually installed.
+
+        Bridges are useless without their transport binary — surfacing
+        this up front avoids the confusing failure mode of Tor silently
+        refusing to build circuits with no obvious explanation.
+        """
+        import shutil as _shutil
+        found = {}
+        for name, bins in cls.PT_BINARIES.items():
+            found[name] = next((b for b in bins if _shutil.which(b)), None)
+        return found
+
+    @classmethod
+    def apply_bridges(cls, transport: str, bridge_lines: list[str]) -> tuple[bool, str]:
+        """Write a managed Bridge/ClientTransportPlugin block into torrc and restart Tor.
+
+        Bridge fingerprints/certs are not something this app invents or
+        hard-codes — real, current ones must come from
+        https://bridges.torproject.org (or `moat`/Tor Browser) and be
+        pasted in by the user, since baked-in defaults go stale and a
+        wrong hard-coded fingerprint just fails silently.
+
+        (خط‌های Bridge رو داخل torrc می‌نویسه و Tor رو ری‌استارت می‌کنه.
+        این برنامه هیچ fingerprint ای رو خودش نمی‌سازه — چون این مقادیر
+        دائم تغییر می‌کنن و باید از bridges.torproject.org گرفته بشن.)
+        """
+        if not cls.helper_available():
+            return False, f"Privileged helper missing at {cls.HELPER_PATH} — run setup.sh"
+        if not bridge_lines:
+            return cls.clear_bridges()
+
+        pt_bin_map = cls.detect_pt_binaries()
+        lines = ["UseBridges 1"]
+        if transport != "custom":
+            binary = pt_bin_map.get(transport)
+            if not binary:
+                pkg_hint = {
+                    "obfs4": "obfs4proxy", "meek-azure": "meek-client", "snowflake": "snowflake-client"
+                }.get(transport, transport)
+                return False, (f"{pkg_hint} not installed — install it first "
+                                f"(see setup.sh / your package manager), then apply bridges again.")
+            import shutil as _shutil
+            path = _shutil.which(binary)
+            lines.append(f"ClientTransportPlugin {transport} exec {path}")
+
+        for raw in bridge_lines:
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            lines.append(raw if raw.startswith("Bridge ") else f"Bridge {raw}")
+
+        content = "\n".join(lines)
+        b64 = base64.b64encode(content.encode()).decode()
+        ok, out = cls._helper("write-bridges", input_text=b64)
+        if not ok:
+            return False, f"helper error: {out}"
+        return True, f"Bridges applied ({transport}, {len(bridge_lines)} line(s)) — Tor restarted"
+
+    @classmethod
+    def clear_bridges(cls) -> tuple[bool, str]:
+        """Remove the managed bridge block from torrc — back to a direct connection."""
+        if not cls.helper_available():
+            return False, f"Privileged helper missing at {cls.HELPER_PATH} — run setup.sh"
+        ok, out = cls._helper("write-bridges", input_text="")
+        if not ok:
+            return False, f"helper error: {out}"
+        return True, "Bridges cleared — Tor will connect directly, restarted"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -446,6 +756,106 @@ def _make_icon(mode: str, size: int = 22) -> QIcon:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  BridgesDialog  — pluggable-transport / anti-censorship bridge management
+# ══════════════════════════════════════════════════════════════════════════════
+class BridgesDialog(QDialog):
+    """Lets the user switch Tor to connect via a bridge + pluggable transport.
+
+    Real bridge lines (with current fingerprints/certs) are NOT hard-coded
+    here — they go stale and a wrong baked-in value just fails silently.
+    The user fetches current ones from https://bridges.torproject.org (a
+    button below opens it) and pastes them in.
+
+    (دیالوگ مدیریت بریج — برای وصل‌شدن به Tor از طریق بریج/ترنسپورت
+    ضدسانسور مثل obfs4، meek-azure یا Snowflake. مقادیر بریج رو خود کاربر
+    از bridges.torproject.org می‌گیره و اینجا پیست می‌کنه.)
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Bridges / Anti-Censorship")
+        self.setFixedSize(420, 460)
+        self.setStyleSheet(f"""
+            QDialog {{ background: {P['bg']}; }}
+            QLabel {{ color: {P['text']}; font-family: 'JetBrains Mono', monospace; font-size: 11px; }}
+            QComboBox, QTextEdit {{
+                background: {P['surface']}; color: {P['text']};
+                border: 1px solid {P['border']}; border-radius: 6px; padding: 4px;
+                font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            }}
+            QPushButton {{
+                border-radius: 7px; font-size: 11px; font-weight: 600;
+                border: 1px solid {P['border']}; padding: 6px 10px;
+                background: {P['surface2']}; color: {P['text']};
+            }}
+            QPushButton:hover {{ background: {P['border']}; }}
+        """)
+
+        v = QVBoxLayout(self)
+
+        info = QLabel(
+            "Route Tor through a bridge to hide the fact that you're using Tor "
+            "from your ISP/network (useful under DPI-based censorship).\n\n"
+            "1. Pick a transport below.\n"
+            "2. Get current bridge lines from bridges.torproject.org.\n"
+            "3. Paste them (one per line) and click Apply."
+        )
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        pt_found = TorControl.detect_pt_binaries()
+        self._combo = QComboBox()
+        for key, label in [
+            ("custom", "Direct Bridge line(s) (any transport)"),
+            ("obfs4", f"obfs4 {'✓ installed' if pt_found.get('obfs4') else '✗ not installed'}"),
+            ("meek-azure", f"meek-azure {'✓ installed' if pt_found.get('meek-azure') else '✗ not installed'}"),
+            ("snowflake", f"snowflake {'✓ installed' if pt_found.get('snowflake') else '✗ not installed'}"),
+        ]:
+            self._combo.addItem(label, userData=key)
+        v.addWidget(self._combo)
+
+        open_btn = QPushButton("🌐  Open bridges.torproject.org")
+        open_btn.clicked.connect(lambda: webbrowser.open("https://bridges.torproject.org/"))
+        v.addWidget(open_btn)
+
+        v.addWidget(QLabel("Bridge line(s):"))
+        self._text = QTextEdit()
+        self._text.setPlaceholderText(
+            "obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0\n"
+            "(paste one or more lines from bridges.torproject.org)"
+        )
+        v.addWidget(self._text)
+
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("✓  Apply")
+        apply_btn.clicked.connect(self._apply)
+        clear_btn = QPushButton("✕  Clear (direct connection)")
+        clear_btn.clicked.connect(self._clear)
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(clear_btn)
+        v.addLayout(btn_row)
+
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        v.addWidget(self._status)
+
+    def _apply(self) -> None:
+        transport = self._combo.currentData()
+        lines = [ln for ln in self._text.toPlainText().splitlines() if ln.strip()]
+        if not lines:
+            self._status.setText("⚠ No bridge lines entered.")
+            return
+        ok, out = TorControl.apply_bridges(transport, lines)
+        self._status.setText(("✓ " if ok else "✗ ") + out)
+
+    def _clear(self) -> None:
+        ok, out = TorControl.clear_bridges()
+        self._status.setText(("✓ " if ok else "✗ ") + out)
+        if ok:
+            self._text.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Dashboard  — main popup window
 # ══════════════════════════════════════════════════════════════════════════════
 class Dashboard(QWidget):
@@ -453,8 +863,17 @@ class Dashboard(QWidget):
     def __init__(self, probe: TorProbe) -> None:
         super().__init__()
         self.probe = probe
-        self._ks_on    = False
-        self._tp_on    = False
+        # Query the real firewall state instead of assuming OFF. If the app
+        # (or system) restarted while the kill switch / transparent proxy
+        # was active, the iptables rules survive but the old code always
+        # initialized to False here — showing "protection off" in the UI
+        # while the machine was actually still locked down (or vice versa
+        # after a manual `iptables -F`).
+        # (وضعیت واقعی فایروال رو موقع شروع برنامه می‌خونیم، نه این‌که فرض
+        # کنیم خاموشه — چون بعد از ری‌استارت ممکنه قوانین قبلی هنوز فعال
+        # باشن.)
+        self._ks_on    = TorControl.killswitch_status()
+        self._tp_on    = TorControl.transparent_proxy_status()
         self._drag_pos: Optional[QPoint] = None
         self._log_buf: deque[str] = deque(maxlen=LOG_MAXLEN)
 
@@ -469,6 +888,7 @@ class Dashboard(QWidget):
 
         self._build()
         self._style()
+        self._sync_toggle_buttons()
 
     # ── build ─────────────────────────────────────────────────────────────────
     def _build(self) -> None:
@@ -558,6 +978,7 @@ class Dashboard(QWidget):
         self._b_newid   = self._mk_btn("⟳  New Identity",  "purple", self._act_newid)
         self._b_ks      = self._mk_btn("🔒  Kill Switch",   "orange", self._act_ks)
         self._b_tp      = self._mk_btn("⬡  Transparent",   "teal",   self._act_tp)
+        self._b_bridges = self._mk_btn("🌉  Bridges",       "dim",    self._open_bridges)
         self._b_probe   = self._mk_btn("⟳  Check Now",     "dim",    self._act_probe)
 
         g.addWidget(self._b_start,   0, 0)
@@ -566,7 +987,8 @@ class Dashboard(QWidget):
         g.addWidget(self._b_newid,   1, 1)
         g.addWidget(self._b_ks,      2, 0)
         g.addWidget(self._b_tp,      2, 1)
-        g.addWidget(self._b_probe,   3, 0, 1, 2)
+        g.addWidget(self._b_bridges, 3, 0)
+        g.addWidget(self._b_probe,   3, 1)
         lay.addLayout(g)
 
         # ── log ───────────────────────────────────────────────────────────────
@@ -704,7 +1126,7 @@ class Dashboard(QWidget):
         self._push_log("INFO", f"{state.mode.upper():12s}  exit={state.exit_ip}"
                        + (f"  {state.latency_ms}ms" if state.latency_ms else "")
                        + (f"  [{state.country}]" if state.country != "—" else "")
-                       + (f"  ⚠ LEAK" if state.leak else ""))
+                       + ("  ⚠ LEAK" if state.leak else ""))
 
     # ── log ───────────────────────────────────────────────────────────────────
     def _push_log(self, level: str, msg: str) -> None:
@@ -747,37 +1169,58 @@ class Dashboard(QWidget):
         if ok:
             QTimer.singleShot(3000, self.probe.probe_now)
 
-    def _act_ks(self) -> None:
-        self._ks_on = not self._ks_on
+    def _sync_toggle_buttons(self) -> None:
+        """Reflect the (possibly restart-recovered) real state onto the buttons."""
         if self._ks_on:
-            ok, out = TorControl.killswitch_on()
             self._b_ks.setText("🔓  Kill Switch: ON")
             self._b_ks.setObjectName("btn_orange_on")
         else:
-            ok, out = TorControl.killswitch_off()
             self._b_ks.setText("🔒  Kill Switch")
             self._b_ks.setObjectName("btn_orange")
-        self._b_ks.setStyleSheet("")
-        self._style()
-        self._push_log("OK" if ok else "ERR", out)
-
-    def _act_tp(self) -> None:
-        self._tp_on = not self._tp_on
         if self._tp_on:
-            ok, out = TorControl.transparent_proxy_on()
             self._b_tp.setText("⬡  Transparent: ON")
             self._b_tp.setObjectName("btn_teal_on")
         else:
-            ok, out = TorControl.transparent_proxy_off()
             self._b_tp.setText("⬡  Transparent")
             self._b_tp.setObjectName("btn_teal")
+        self._b_ks.setStyleSheet("")
         self._b_tp.setStyleSheet("")
         self._style()
+
+    def _act_ks(self) -> None:
+        # Only flip internal/UI state *after* confirming the firewall
+        # command actually succeeded. Previously the state flipped first,
+        # so a failed iptables call (permission denied, missing binary,
+        # etc.) still left the UI claiming the kill switch was ON/OFF while
+        # the real firewall rules hadn't changed at all.
+        # (وضعیت داخلی رو فقط بعد از تأیید موفقیت واقعی دستور عوض می‌کنیم —
+        # نه قبلش — تا UI هیچ‌وقت وضعیت اشتباه نشون نده.)
+        target_on = not self._ks_on
+        ok, out = TorControl.killswitch_on() if target_on else TorControl.killswitch_off()
+        if ok:
+            self._ks_on = target_on
+        else:
+            self._push_log("ERR", f"Kill switch state unchanged — command failed: {out}")
+        self._sync_toggle_buttons()
+        self._push_log("OK" if ok else "ERR", out)
+
+    def _act_tp(self) -> None:
+        target_on = not self._tp_on
+        ok, out = TorControl.transparent_proxy_on() if target_on else TorControl.transparent_proxy_off()
+        if ok:
+            self._tp_on = target_on
+        else:
+            self._push_log("ERR", f"Transparent proxy state unchanged — command failed: {out}")
+        self._sync_toggle_buttons()
         self._push_log("OK" if ok else "ERR", out)
 
     def _act_probe(self) -> None:
         self._push_log("INFO", "Manual probe triggered…")
         self.probe.probe_now()
+
+    def _open_bridges(self) -> None:
+        dlg = BridgesDialog(self)
+        dlg.exec()
 
     # ── drag ─────────────────────────────────────────────────────────────────
     def _mp(self, ev) -> None:
@@ -896,6 +1339,15 @@ def main() -> None:
     dash.log_event("INFO", "Tor Control Center v2 started")
     if not _HAS_REQUESTS:
         dash.log_event("WARN", "requests not found — install:  pip3 install requests[socks]")
+    if dash._ks_on or dash._tp_on:
+        dash.log_event(
+            "INFO",
+            f"Recovered firewall state on startup: "
+            f"kill_switch={'ON' if dash._ks_on else 'off'}  "
+            f"transparent_proxy={'ON' if dash._tp_on else 'off'}"
+        )
+    if not TorControl._has_ip6tables():
+        dash.log_event("WARN", "ip6tables unavailable on this system — IPv6 traffic is NOT filtered by the kill switch")
 
     sys.exit(app.exec())
 

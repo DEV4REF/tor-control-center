@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy this file to ~/.config/tor-control-center/config.json and edit as needed. Any key you omit falls back to the built-in default.",
+
+  "tor_socks_host":   "127.0.0.1",
+  "tor_socks_port":   9050,
+  "tor_control_port": 9051,
+  "tor_trans_port":   9040,
+  "tor_dns_port":     5353,
+
+  "tor_check_url":    "https://check.torproject.org/api/ip",
+  "geoip_url":        "https://ipapi.co/{ip}/json/",
+  "direct_ip_url":    "https://api.ipify.org?format=json",
+
+  "poll_normal_sec":  8,
+  "poll_fast_sec":    2,
+  "request_timeout":  10,
+  "log_maxlen":       300
+}
